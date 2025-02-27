@@ -1,9 +1,8 @@
 from datetime import datetime, timedelta
 from fastapi import Depends
-from sqlalchemy import select
-from sqlalchemy.sql import Select
+from sqlalchemy import Select
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy import func, select, and_, func
+from sqlalchemy import func, select, and_
 
 from backend.models.office_hours.ticket_type import TicketType
 
@@ -44,9 +43,11 @@ class OfficeHoursStatisticsService:
         self._session = session
         self._office_hours_svc = _office_hours_svc
 
-    def apply_filters(self, statement: Select, site_id: int, pagination_params: TicketPaginationParams):
+    def generate_filtered_statements(
+        self, site_id: int, pagination_params: TicketPaginationParams
+    ) -> tuple[Select, Select]:
         """
-        Apply filters to the given statement based on the pagination parameters.
+        Generate the base and length statements with applied filters.
         """
         # Alias the section member entity so that we can join to this table
         # multiple times. The `CreatorEntity` alias will be used for filtering
@@ -55,6 +56,22 @@ class OfficeHoursStatisticsService:
         CreatorEntity = aliased(SectionMemberEntity)
         CallerEntity = aliased(SectionMemberEntity)
 
+        statement = (
+            select(OfficeHoursTicketEntity)
+            .join(OfficeHoursEntity)
+            .join(CourseSiteEntity)
+            .where(CourseSiteEntity.id == site_id)
+            .where(OfficeHoursTicketEntity.state == TicketState.CLOSED)
+        )
+
+        length_statement = (
+            select(func.count())
+            .select_from(OfficeHoursTicketEntity)
+            .join(OfficeHoursEntity)
+            .join(CourseSiteEntity)
+            .where(CourseSiteEntity.id == site_id)
+            .where(OfficeHoursTicketEntity.state == TicketState.CLOSED)
+        )
 
         # Filter by Start/End Range
         if pagination_params.range_start != "":
@@ -65,6 +82,7 @@ class OfficeHoursStatisticsService:
                 OfficeHoursTicketEntity.created_at <= datetime.fromisoformat(range_end),
             )
             statement = statement.where(criteria)
+            length_statement = length_statement.where(criteria)
 
         # Filter by student who created ticket
         if len(pagination_params.student_ids) != 0:
@@ -72,51 +90,113 @@ class OfficeHoursStatisticsService:
                 statement.join(user_created_tickets_table)
                 .join(
                     CreatorEntity,
-                    CreatorEntity.id == user_created_tickets_table.c.member_id, # why no definition
+                    CreatorEntity.id == user_created_tickets_table.c.member_id,
                 )
                 .where(CreatorEntity.user_id.in_(pagination_params.student_ids))
             )
-        
+            length_statement = (
+                length_statement.join(user_created_tickets_table)
+                .join(
+                    CreatorEntity,
+                    CreatorEntity.id == user_created_tickets_table.c.member_id,
+                )
+                .where(CreatorEntity.user_id.in_(pagination_params.student_ids))
+            )
+
         # Filter by staff member who called ticket
         if len(pagination_params.staff_ids) != 0:
             statement = statement.join(
                 CallerEntity,
                 CallerEntity.id == OfficeHoursTicketEntity.caller_id,
             ).where(CallerEntity.user_id.in_(pagination_params.staff_ids))
+            length_statement = length_statement.join(
+                CallerEntity,
+                CallerEntity.id == OfficeHoursTicketEntity.caller_id,
+            ).where(CallerEntity.user_id.in_(pagination_params.staff_ids))
 
-        offset = pagination_params.page * pagination_params.page_size
-        limit = pagination_params.page_size
+        return statement, length_statement
 
-        # Retrieve limited items
-        statement = statement.offset(offset).limit(limit)
+    def get_statistics(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> dict:
+        """
+        Retrieve various statistics for a course site based on filtered tickets.
+        """
+        # Check permissions
+        self._office_hours_svc._check_site_admin_permissions(user, site_id)
 
-        return statement
-    
+        # Get the filtered statements
+        statement, length_statement = self.generate_filtered_statements(site_id, pagination_params)
+
+        # Total number of tickets
+        total_tickets = self._session.execute(length_statement).scalar()
+
+        # Total number of tickets for the current week
+        today = datetime.today()
+        start_of_week = today - timedelta(days=today.weekday())
+        week_tickets_statement = statement.subquery().where(OfficeHoursTicketEntity.created_at >= start_of_week)
+        week_tickets = self._session.execute(select(func.count()).select_from(week_tickets_statement.subquery())).scalar()
+
+        # Average wait time
+        avg_wait_time_statement = (
+            select(
+                func.avg(
+                    func.extract(
+                        "epoch",
+                        OfficeHoursTicketEntity.called_at
+                        - OfficeHoursTicketEntity.created_at,
+                    )
+                )
+            )
+            .select_from(statement.subquery())
+            .select_from(statement.subquery())
+            .where(OfficeHoursTicketEntity.called_at.isnot(None))
+        )
+        avg_wait_time = self._session.execute(avg_wait_time_statement).scalar()
+        avg_wait_time_minutes = avg_wait_time / 60 if avg_wait_time else 0
+
+        # Average duration
+        avg_duration_statement = (
+            select(
+                func.avg(
+                    func.extract(
+                        "epoch",
+                        OfficeHoursTicketEntity.closed_at
+                        - OfficeHoursTicketEntity.called_at,
+                    )
+                )
+            )
+            .select_from(statement.subquery())
+            .where(OfficeHoursTicketEntity.closed_at.isnot(None))
+            .where(OfficeHoursTicketEntity.closed_at.isnot(None))
+        )
+        avg_duration = self._session.execute(avg_duration_statement).scalar()
+        avg_duration_minutes = avg_duration / 60 if avg_duration else 0
+        assignment_help_statement = statement.subquery().where(OfficeHoursTicketEntity.type == TicketType.ASSIGNMENT_HELP)
+        # Total 'Assignment Help' tickets
+        assignment_help_statement = statement.where(OfficeHoursTicketEntity.type == TicketType.ASSIGNMENT_HELP)
+        total_assignment_help = self._session.execute(select(func.count()).select_from(assignment_help_statement.subquery())).scalar()
+
+        # Total 'Conceptual Help' tickets
+        conceptual_help_statement = statement.subquery().where(OfficeHoursTicketEntity.type == TicketType.CONCEPTUAL_HELP)
+        total_conceptual_help = self._session.execute(select(func.count()).select_from(conceptual_help_statement.subquery())).scalar()
+
+        return {
+            "total_tickets": total_tickets,
+            "week_tickets": week_tickets,
+            "avg_wait_time_minutes": avg_wait_time_minutes,
+            "avg_duration_minutes": avg_duration_minutes,
+            "total_assignment_help": total_assignment_help,
+            "total_conceptual_help": total_conceptual_help,
+        }
+
+
     def get_paginated_tickets(
         self, user: User, site_id: int, pagination_params: TicketPaginationParams
     ) -> Paginated[OfficeHourTicketOverview]:
         # Check permissions
         self._office_hours_svc._check_site_admin_permissions(user, site_id)
 
-        statement = (
-            select(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.state == TicketState.CLOSED)
-        )
-        
-        statement = self.apply_filters(statement, site_id, pagination_params)
-
-        length_statement = (
-            select(func.count())
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.state == TicketState.CLOSED)
-        )
-        length_statement = self.apply_filters(length_statement, site_id, pagination_params)
+        # Get the filtered statements
+        statement, length_statement = self.get_statements(site_id, pagination_params)
 
         # Calculate where to begin retrieving rows and how many to retrieve
         offset = pagination_params.page * pagination_params.page_size
@@ -131,143 +211,7 @@ class OfficeHoursStatisticsService:
 
         # Convert `UserEntity`s to model and return page
         return Paginated(
-            items=[entity.to_overview_model() for entity in entities], # why no definition
+            items=[entity.to_overview_model() for entity in entities],
             length=length,
             params=pagination_params,
         )
-
-    def get_ticket_count(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the total number of filtered tickets created for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        total_tickets_statement = (
-            select(func.count())
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-        )
-        total_tickets_statement = self.apply_filters(total_tickets_statement, site_id, pagination_params)
-        total_tickets = self._session.execute(total_tickets_statement).scalar()
-        return total_tickets
-
-    def get_week_ticket_count(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the total number of tickets, for the current week, created for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        today = datetime.today()
-        start_of_week = today - timedelta(days=today.weekday())
-        week_tickets_statement = (
-            select(func.count())
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.created_at >= start_of_week)
-        )
-        week_tickets_statement = self.apply_filters(week_tickets_statement, site_id, pagination_params)
-        week_tickets = self._session.execute(week_tickets_statement).scalar()
-        return week_tickets
-
-    def get_average_wait(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the average wait time of tickets for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        avg_wait_time_statement = (
-            select(
-                func.avg(
-                    func.extract(
-                        "epoch",
-                        OfficeHoursTicketEntity.called_at
-                        - OfficeHoursTicketEntity.created_at,
-                    )
-                )
-            )
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.called_at.isnot(None))
-        )
-        avg_wait_time_statement = self.apply_filters(avg_wait_time_statement, site_id, pagination_params)
-        avg_wait_time = self._session.execute(avg_wait_time_statement).scalar()
-        avg_wait_time_minutes = avg_wait_time / 60 if avg_wait_time else 0
-        return avg_wait_time_minutes
-
-    def get_average_duration(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the average duration of tickets for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        avg_duration_statement = (
-            select(
-                func.avg(
-                    func.extract(
-                        "epoch",
-                        OfficeHoursTicketEntity.closed_at
-                        - OfficeHoursTicketEntity.called_at,
-                    )
-                )
-            )
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.closed_at.isnot(None))
-        )
-        avg_duration_statement = self.apply_filters(avg_duration_statement, site_id, pagination_params)
-        avg_duration = self._session.execute(avg_duration_statement).scalar()
-        avg_duration_minutes = avg_duration / 60 if avg_duration else 0
-        return avg_duration_minutes
-
-    def total_assignment_help(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the total number of 'Assignment Help' tickets for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        assignment_help_statement = (
-            select(func.count())
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.type == TicketType.ASSIGNMENT_HELP)
-        )
-        assignment_help_statement = self.apply_filters(assignment_help_statement, site_id, pagination_params)
-        total_assignment_help = self._session.execute(assignment_help_statement).scalar()
-        return total_assignment_help
-
-    def total_conceptual_help(self, user: User, site_id: int, pagination_params: TicketPaginationParams) -> int:
-        """
-        Retrieve the total number of 'Conceptual Help' tickets for a course site.
-        """
-        # Check permissions
-        self._office_hours_svc._check_site_admin_permissions(user, site_id)
-
-        conceptual_help_statement = (
-            select(func.count())
-            .select_from(OfficeHoursTicketEntity)
-            .join(OfficeHoursEntity)
-            .join(CourseSiteEntity)
-            .where(CourseSiteEntity.id == site_id)
-            .where(OfficeHoursTicketEntity.type == TicketType.CONCEPTUAL_HELP)
-        )
-        conceptual_help_statement = self.apply_filters(conceptual_help_statement, site_id, pagination_params)
-        total_conceptual_help = self._session.execute(conceptual_help_statement).scalar()
-        return total_conceptual_help
-
-
-    
